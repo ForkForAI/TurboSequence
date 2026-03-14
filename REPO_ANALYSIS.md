@@ -261,3 +261,75 @@ ATurboSequence_Manager_Lf::SolveMeshes_GameThread(DeltaTime, World, Ctx);
 ```
 
 > 上面这段与仓库文档中的最小 Demo 思路一致：先创建实例、放入更新组、播放动画，再在 Tick 中持续调用求解。
+
+---
+
+## 8. 关于“动画融合能力”的直接结论（FAQ）
+
+> Q1：这个插件有实现动画融合吗？
+
+有，且是多种融合方式并存：
+
+1. **多动画并行权重融合**：同一实例维护 `AnimationMetaData` 数组，每条动画都有独立权重与时间推进。  
+2. **BlendSpace 融合**：`PlayBlendSpace` 会把每个 sample 作为动画条目播放，再按 BlendSpace 结果动态回写 sample 的权重与时间。  
+3. **按骨骼层融合**：通过 `BoneLayerMasks` 和 `ForceMode`（`None/PerLayer/AllLayers`）实现分层叠加或同层替换。
+
+> Q2：最多多少个动作融合？
+
+源码没有给固定的“硬编码上限常量（例如最多 4 个/8 个）”，因为内部核心容器是动态数组（`TArray`）并可持续 `Add`。  
+但工程上存在**实际约束**：
+
+- 动画索引/层索引中有多处 `uint16/int16`，理论上会受 16 位范围影响；
+- 每帧动画条目越多，CPU 侧求解、RenderThread 打包、GPU 参数上传与计算成本越高；
+- BlendSpace 的融合条目数还受该 BlendSpace 自身 sample 数影响（`NumSamples = BlendSpace->GetBlendSamples().Num()`）。
+
+因此更准确的说法是：**逻辑上“可多条融合”，但上限由数据类型与性能预算共同决定，不是文档里给死的固定值。**
+
+> Q3：相比 Animation Blueprint 的自由度，哪些方面有欠缺？
+
+TurboSequence 的定位是“大规模实例吞吐优先”，与 ABP 的“图形化动画表达”是两种取舍。和 ABP 相比，主要欠缺在：
+
+1. **工作流层面**：更偏 C++/API 编排（`Play/Tweak/Solve`）而非完整 AnimGraph/StateMachine 图编辑体验。  
+2. **控制器负担**：项目通常要自己写 Animation Controller（文档也明确建议这样做），不像 ABP 那样节点化开箱即用。  
+3. **蓝图便利性**：虽有蓝图 API，但仓库明确不支持 blueprint-only 项目，且官方建议 C++ 路径。  
+
+换句话说：
+
+- 如果目标是 **大量角色并发 + 可控性能结构**，TurboSequence 的收益很大；
+- 如果目标是 **角色级复杂动画图编排自由度**，ABP 的创作体验通常更强。
+
+### 8.1 对照式伪代码（ABP 思维 vs TurboSequence 思维）
+
+```cpp
+// ABP 思维（概念化）
+// 状态机/过渡规则/LayeredBlendPerBone 在 AnimGraph 内声明，运行时自动驱动
+AnimGraph()
+{
+    BasePose = StateMachine(Idle, Walk, Run, Jump, ...);
+    UpperBody = SlotOrLayer(AttackMontage, AimOffset, ...);
+    FinalPose = LayeredBlendPerBone(BasePose, UpperBody, BoneMasks);
+}
+
+
+// TurboSequence 思维（概念化）
+// 业务代码显式管理播放、层、权重与每帧 Solve
+BeginPlay()
+{
+    Mesh = AddSkinnedMeshInstance(...);
+    AddInstanceToUpdateGroup(0, Mesh);
+
+    PlayAnimation(Mesh, Idle,   Settings{BoneLayerMasks=[], Weight=1.0});
+    PlayAnimation(Mesh, Aim,    Settings{BoneLayerMasks=[Spine...], Weight=0.6});
+    PlayBlendSpace(Mesh, MoveBS, Settings{BoneLayerMasks=[], ForceMode=PerLayer});
+}
+
+Tick(DeltaTime)
+{
+    // 根据输入/AI 调整权重与 BlendSpace 采样位置
+    TweakAnimation(Aim, Settings{Weight=AimWeight});
+    TweakBlendSpace(MoveBS, FVector3f(Speed, Direction, 0));
+
+    // 显式求解
+    SolveMeshes_GameThread(DeltaTime, World, UpdateContext{GroupIndex=0});
+}
+```
