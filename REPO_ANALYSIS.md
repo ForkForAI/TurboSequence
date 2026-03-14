@@ -131,3 +131,133 @@ TurboSequence 本质上是一个“**把 SkeletalMesh 动画求值与渲染拆�
 - 用实例化渲染 + 材质顶点蒙皮完成大规模角色绘制。
 
 它牺牲了部分原生 SkeletalMesh 管线的一体化便利，换来 crowd 场景下更高的吞吐和可控的性能结构。
+
+---
+
+## 7. 关键实现代码与伪代码（便于快速落地）
+
+下面补充“能直接对照源码理解”的代码片段/伪代码。
+
+### 7.1 运行时主循环伪代码（`SolveMeshes_GameThread`）
+
+```cpp
+void SolveMeshes_GameThread(float DeltaTime, UWorld* World, FTurboSequence_UpdateContext_Lf Ctx)
+{
+    if (RuntimeMeshes.Empty() || !ManagerInstance)
+        return;
+
+    // 1) 更新相机（用于可见性与 LOD）
+    UpdateCameras(CameraViews, LastFrameCameraTransforms, World, DeltaTime, Ctx.CustomCameraInfo);
+
+    // 2) 并行遍历本组 Mesh
+    ParallelFor(UpdateGroups[Ctx.GroupIndex].RawIDs.Num(), [&](int32 Index)
+    {
+        int32 MeshID = UpdateGroups[Ctx.GroupIndex].RawIDs[Index];
+        Runtime = RuntimeSkinnedMeshes[MeshID];
+        Reference = PerReferenceData[Runtime.DataAsset];
+
+        SolveAnimations(Runtime, Reference, DeltaTime, FrameCount);     // 动画状态推进
+        IsMeshVisible(Runtime, Reference, CameraViews);                 // 可见性检查
+        UpdateCullingAndLevelOfDetail(Runtime, Reference, CameraViews); // LOD / Cull
+        UpdateDistanceUpdating(Runtime, DeltaTime);                     // 距离更新频率
+
+        // 组装渲染线程最小输入（动画片段、IK 数据等）
+        EnqueueRenderThreadInput(Runtime, Reference);
+
+        ClearIKState(Runtime);
+    });
+
+    // 3) 动画库增量上传（chunked）
+    if (AnimationLibraryDataAllocatedThisFrame.Num())
+    {
+        ENQUEUE_RENDER_COMMAND(AddLibraryChunked)(...);
+    }
+}
+```
+
+### 7.2 渲染线程与 Compute Shader 伪代码
+
+```cpp
+void SolveMeshes_RenderThread(FRHICommandListImmediate& RHICmdList)
+{
+    ResizeBuffers(GlobalLibrary_RenderThread, NumMeshes);
+
+    ParallelFor(NumMeshes, [&](int32 i)
+    {
+        RuntimeRT = RuntimeSkinnedMeshesRT[HashMap[i]];
+        if (!RuntimeRT.bIsVisible)
+            return;
+
+        int32 MeshIndex = NumMeshesVisibleCurrentFrame++;
+        Params.PerMeshCustomDataIndex_RenderThread[MeshIndex] = MeshIDToGlobalIndex[RuntimeRT.MeshID];
+        Params.NumAnimations += RuntimeRT.AnimationMetaData_RenderThread.Num();
+
+        if (RuntimeRT.bIKDataInUse)
+            AccumulateIKParams(RuntimeRT, Params);
+    });
+
+    Params.NumMeshes     = NumMeshesVisibleCurrentFrame;
+    Params.NumAnimations = max(Params.NumAnimations, 1);
+    Params.NumIKData     = max(Params.NumIKData, 1);
+
+    DispatchMeshUnitComputeShader(Params, TransformTexture_CurrentFrame);
+}
+```
+
+### 7.3 材质顶点蒙皮逻辑伪代码（`VertexSkin`）
+
+```hlsl
+for influenceBlock in 0..2:                 // 每个顶点最多 12 influence（3 组 * 4）
+    Indices = SkinWeightTexture[VertexBase + influenceBlock*2]
+    Weights = SkinWeightTexture[VertexBase + influenceBlock*2 + 1]
+
+    for w in 0..3:
+        if earlyOut && Weights[w] == 0:
+            return
+
+        BoneBase = TransformTextureOffset + Indices[w] * Settings0_W
+        M0 = TransformTexture_Current[BoneBase + 0]
+        M1 = TransformTexture_Current[BoneBase + 1]
+        M2 = TransformTexture_Current[BoneBase + 2]
+
+        Weight = Weights[w] / 255.0
+        FinalCurrentBlendPosition += (mul(float3x4(M0,M1,M2), float4(VertexPos,1)) - VertexPos) * Weight
+```
+
+### 7.4 实例渲染桥接伪代码（Niagara / ISMC）
+
+```cpp
+for each RenderData:
+    if (UseISMC)
+    {
+        for each InstanceIndex:
+            UpdateInstanceTransform(InstanceIndex, Position/Rotation/Scale);
+            SetCustomData(InstanceIndex, CustomData);
+        MarkRenderStateDirty();
+    }
+    else // Niagara
+    {
+        SetNiagaraArrayUInt8 (LOD);
+        SetNiagaraArrayFloat (CustomData);
+        SetNiagaraArrayPosition(Position);
+        SetNiagaraArrayVector4(Rotation);
+        SetNiagaraArrayVector (Scale);
+        SetEmitterFixedBounds(Bounds);
+    }
+```
+
+### 7.5 一个最小调用流程（业务代码视角）
+
+```cpp
+// BeginPlay
+Instance = ATurboSequence_Manager_Lf::AddSkinnedMeshInstance_GameThread(SpawnData, SpawnTransform, World);
+ATurboSequence_Manager_Lf::AddInstanceToUpdateGroup_Concurrent(0, Instance);
+ATurboSequence_Manager_Lf::PlayAnimation_Concurrent(Instance, WalkAnim, PlaySettings);
+
+// Tick
+FTurboSequence_UpdateContext_Lf Ctx;
+Ctx.GroupIndex = 0;
+ATurboSequence_Manager_Lf::SolveMeshes_GameThread(DeltaTime, World, Ctx);
+```
+
+> 上面这段与仓库文档中的最小 Demo 思路一致：先创建实例、放入更新组、播放动画，再在 Tick 中持续调用求解。
